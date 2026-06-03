@@ -642,28 +642,9 @@ async function connect() {
     const rootPath = (f === '/') ? '' : f;
     folderQueue.push(rootPath);
 
-    // 画像が見つかるまでフォルダを順に処理
+    // バックグラウンドスキャン開始（画像が見つかり次第自動で表示）
     setLoadingMsg('フォルダを検索中...');
-    while (!files.length && !scanDone) {
-      await scanNextFolder();
-      setLoadingMsg('検索中... 画像 ' + totalFound + ' 枚 / フォルダ ' + folderCount + ' 個');
-    }
-
-    if (!files.length) {
-      hideLoading();
-      showError('画像が見つかりませんでした。\nフォルダパスを確認してください（例: /写真）\n対応形式: JPG, PNG, GIF, WebP, HEIC など');
-      showSetup();
-      return;
-    }
-
-    document.getElementById('welcome').classList.add('hidden');
-    hideLoading();
-    buildQueue();
-    updateFolderBadge();
-    updateStats();
-    showCurrent();
-
-    if (!scanDone) bgScan();
+    bgScan();
 
   } catch(e) {
     hideLoading();
@@ -751,33 +732,73 @@ async function scanNextFolder() {
   }
 }
 
-// バックグラウンドスキャン
-async function bgScan() {
-  if (scanRunning || scanDone) return;
-  scanRunning = true;
-  let retries = 0;
-  while (!scanDone && files.length < BATCH_SIZE) {
-    try {
-      const prevLen = files.length;
-      await scanNextFolder();
-      retries = 0;
-      updateFolderBadge();
-      updateStats();
-      // 新しく追加された分をキューにランダム挿入
-      for (let i = prevLen; i < files.length; i++) {
-        const pos = Math.floor(Math.random() * (queue.length - queuePos + 1)) + queuePos;
-        queue.splice(pos, 0, i);
-      }
-      await sleep(80);
-    } catch(e) {
-      retries++;
-      if (retries > 5) { console.warn('バックグラウンド取得中断:', e.message); break; }
-      await sleep(2000 * retries);
-    }
+// バックグラウンドスキャン（setTimeoutで細切れ実行しUIを固めない）
+let bgRetries = 0;
+let bgStarted = false;
+
+function bgScan() {
+  if (scanRunning || scanDone || bgStarted) return;
+  bgStarted = true;
+  scheduleScan();
+}
+
+function scheduleScan() {
+  // 次のフォルダ処理を0msタイマーで非同期に積む（UIスレッドを解放）
+  setTimeout(doScanStep, 0);
+}
+
+async function doScanStep() {
+  if (scanDone || files.length >= BATCH_SIZE) {
+    scanRunning = false;
+    bgStarted = false;
+    updateFolderBadge();
+    updateStats();
+    return;
   }
-  scanRunning = false;
-  updateFolderBadge();
-  updateStats();
+
+  scanRunning = true;
+  const prevLen = files.length;
+
+  try {
+    await scanNextFolder();
+    bgRetries = 0;
+
+    // 新しく追加された分をキューにランダム挿入
+    for (let i = prevLen; i < files.length; i++) {
+      const pos = Math.floor(Math.random() * (queue.length - queuePos + 1)) + queuePos;
+      queue.splice(pos, 0, i);
+    }
+
+    // 初めて画像が見つかったら表示開始
+    if (prevLen === 0 && files.length > 0) {
+      document.getElementById('welcome').classList.add('hidden');
+      hideLoading();
+      buildQueue();
+      showCurrent();
+    }
+
+    updateFolderBadge();
+    updateStats();
+    setLoadingMsg && setLoadingMsg('検索中... 画像 ' + totalFound + ' 枚 / フォルダ ' + folderCount + ' 個');
+
+  } catch(e) {
+    bgRetries++;
+    if (bgRetries > 5) {
+      console.warn('バックグラウンド取得中断:', e.message);
+      scanRunning = false;
+      bgStarted = false;
+      if (!files.length) {
+        showSetup();
+        showError('検索中にエラーが発生しました:\n' + e.message);
+      }
+      return;
+    }
+    // エラー時は少し待ってリトライ
+    await sleep(2000 * bgRetries);
+  }
+
+  // 次のフォルダへ（UIスレッドを解放しながら継続）
+  scheduleScan();
 }
 
 function buildQueue() {
