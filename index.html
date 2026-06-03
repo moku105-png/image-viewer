@@ -575,26 +575,24 @@ input[type=range]::-webkit-slider-thumb {
 const DROPBOX_API = 'https://api.dropboxapi.com/2';
 const DROPBOX_CONTENT = 'https://content.dropboxapi.com/2';
 const IMG_EXT = new Set(['jpg','jpeg','png','gif','webp','bmp','avif','heic','heif']);
-const BATCH_SIZE = 2000; // 一度に保持するファイルリストの上限
+const BATCH_SIZE = 2000;
 
 let token = '';
-// files は {path, name} の配列。全件保持せず最大 BATCH_SIZE 件まで
 let files = [];
-// 表示用のランダムキュー（インデックス）
 let queue = [];
 let queuePos = 0;
 let shown = 0;
 let history = [], histIdx = -1;
 let autoTimer = null, autoSpeed = 3000;
-let folderCount = 0;
 let urlCache = new Map();
 
-// スキャン状態
-let scanCursor = null;
+// スキャン状態（フォルダキュー方式）
+let folderQueue = [];      // 未処理フォルダのパス一覧
+let folderCursors = {};    // folderPath -> cursor (ページ継続用)
+let folderCount = 0;
 let scanDone = false;
 let scanRunning = false;
-let scanFolder = '';
-let totalFound = 0; // 実際に見つかった総数（files配列はBATCH_SIZEで打ち切り）
+let totalFound = 0;
 
 // ===== SETUP =====
 function showSetup() { document.getElementById('setup-screen').classList.remove('hidden'); }
@@ -638,33 +636,17 @@ async function connect() {
 
     files = []; queue = []; queuePos = 0; shown = 0;
     history = []; histIdx = -1; totalFound = 0; folderCount = 0;
-    scanCursor = null; scanDone = false;
+    folderQueue = []; folderCursors = {}; scanDone = false;
     clearCache();
-    scanFolder = (f === '/') ? '' : f;
 
-    // 画像が見つかるまで最大10ページ取得してから表示開始
-    setLoadingMsg('画像を検索中...');
-    let initPages = 0;
-    while (!files.length && !scanDone && initPages < 10) {
-      await fetchOnePage();
-      initPages++;
-      setLoadingMsg('検索中... ' + totalFound + ' 枚見つかりました（フォルダ ' + folderCount + ' 個）');
-    }
+    const rootPath = (f === '/') ? '' : f;
+    folderQueue.push(rootPath);
 
-    if (!files.length && scanDone) {
-      hideLoading();
-      showError('画像が見つかりませんでした。\nフォルダパスを確認してください（例: /写真）\n対応形式: JPG, PNG, GIF, WebP, HEIC など');
-      showSetup();
-      return;
-    }
-
-    // まだ画像が見つかっていない場合はバックグラウンドで探しながら待機
-    if (!files.length && !scanDone) {
-      setLoadingMsg('画像を検索中... しばらくお待ちください');
-      while (!files.length && !scanDone) {
-        await fetchOnePage();
-        setLoadingMsg('検索中... ' + totalFound + ' 枚見つかりました（フォルダ ' + folderCount + ' 個）');
-      }
+    // 画像が見つかるまでフォルダを順に処理
+    setLoadingMsg('フォルダを検索中...');
+    while (!files.length && !scanDone) {
+      await scanNextFolder();
+      setLoadingMsg('検索中... 画像 ' + totalFound + ' 枚 / フォルダ ' + folderCount + ' 個');
     }
 
     if (!files.length) {
@@ -694,82 +676,99 @@ async function connect() {
   }
 }
 
-// 1ページ取得
-async function fetchOnePage() {
-  const url = scanCursor
-    ? DROPBOX_API + '/files/list_folder/continue'
-    : DROPBOX_API + '/files/list_folder';
-  const body = scanCursor ? { cursor: scanCursor } : { path: scanFolder, recursive: true };
+// 1フォルダ分をページ単位で取得（recursive不使用）
+// サブフォルダはfolderQueueに追加して後で処理
+async function scanNextFolder() {
+  if (folderQueue.length === 0) { scanDone = true; return; }
 
-  console.log('[DBX] request:', url, JSON.stringify(body));
+  const folderPath = folderQueue[0];
+  const cursor = folderCursors[folderPath] || null;
+  const MAX_RETRY = 5;
 
-  let res;
-  try { res = await dbFetch(url, body); }
-  catch(e) { throw new Error('ネットワークエラー: ' + (e.message || String(e))); }
+  for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+    const url = cursor
+      ? DROPBOX_API + '/files/list_folder/continue'
+      : DROPBOX_API + '/files/list_folder';
+    // recursive: false で1フォルダだけ取得
+    const body = cursor ? { cursor } : { path: folderPath, recursive: false };
 
-  console.log('[DBX] response status:', res.status);
-
-  if (!res.ok) {
-    let msg = 'HTTPステータス ' + res.status;
-    try {
-      const j = await res.json();
-      console.log('[DBX] error body:', JSON.stringify(j));
-      msg = j.error_summary || j.error || msg;
-      if (res.status === 409) msg += '\nフォルダパスが存在しないか形式が正しくない可能性があります（先頭に / が必要）';
-      if (res.status === 401) msg += '\nトークンが無効または期限切れです。新しいトークンを生成してください。';
-    } catch(_) {}
-    throw new Error('フォルダ取得エラー: ' + msg);
-  }
-
-  let data;
-  try { data = await res.json(); }
-  catch(e) { throw new Error('レスポンス解析エラー: ' + e.message); }
-
-  console.log('[DBX] entries:', data.entries ? data.entries.length : 0, '/ has_more:', data.has_more);
-
-  // 最初の10件をログに出してファイル種別を確認
-  if (data.entries) {
-    data.entries.slice(0, 10).forEach(e => {
-      console.log('[DBX] entry:', e['.tag'], e.name, e.path_lower || '');
-    });
-  }
-
-  for (const entry of (data.entries || [])) {
-    if (entry['.tag'] === 'file') {
-      const ext = (entry.name.split('.').pop() || '').toLowerCase();
-      console.log('[DBX] file ext:', ext, entry.name);
-      if (IMG_EXT.has(ext)) {
-        totalFound++;
-        if (files.length < BATCH_SIZE) {
-          files.push({ path: entry.path_lower, name: entry.name });
-        }
-      }
-    } else if (entry['.tag'] === 'folder') {
-      folderCount++;
+    let res;
+    try { res = await dbFetch(url, body); }
+    catch(e) {
+      if (attempt >= MAX_RETRY) throw new Error('ネットワークエラー: ' + (e.message || String(e)));
+      await sleep(1500 * attempt); continue;
     }
+
+    if (res.status === 500 || res.status === 429 || res.status === 503) {
+      const wait = res.status === 429 ? 5000 : 2000 * attempt;
+      setLoadingMsg('サーバーエラー(' + res.status + ')、リトライ中... (' + attempt + '/' + MAX_RETRY + ')');
+      if (attempt >= MAX_RETRY) throw new Error('Dropboxサーバーエラー(' + res.status + ')が続いています。');
+      await sleep(wait); continue;
+    }
+
+    if (!res.ok) {
+      let msg = 'HTTPステータス ' + res.status;
+      try {
+        const j = await res.json();
+        msg = j.error_summary || j.error || msg;
+        if (res.status === 409) msg += '\nフォルダパスが存在しないか形式が正しくない可能性があります';
+        if (res.status === 401) msg += '\nトークンが無効または期限切れです';
+      } catch(_) {}
+      throw new Error('フォルダ取得エラー: ' + msg);
+    }
+
+    let data;
+    try { data = await res.json(); }
+    catch(e) { throw new Error('レスポンス解析エラー: ' + e.message); }
+
+    for (const entry of (data.entries || [])) {
+      if (entry['.tag'] === 'file') {
+        const ext = (entry.name.split('.').pop() || '').toLowerCase();
+        if (IMG_EXT.has(ext)) {
+          totalFound++;
+          if (files.length < BATCH_SIZE) {
+            files.push({ path: entry.path_lower, name: entry.name });
+          }
+        }
+      } else if (entry['.tag'] === 'folder') {
+        folderCount++;
+        // サブフォルダをキューに追加
+        folderQueue.push(entry.path_lower);
+      }
+    }
+
+    if (data.has_more) {
+      // 同じフォルダの続きがある→cursorを保存して次回また処理
+      folderCursors[folderPath] = data.cursor;
+    } else {
+      // このフォルダ完了→キューから除去
+      folderQueue.shift();
+      delete folderCursors[folderPath];
+    }
+
+    if (folderQueue.length === 0 && !data.has_more) scanDone = true;
+    return;
   }
-  console.log('[DBX] totalFound so far:', totalFound, '/ files:', files.length);
-  scanCursor = data.cursor || null;
-  scanDone = !data.has_more;
 }
 
-// バックグラウンドスキャン：BATCH_SIZEに達したら停止
+// バックグラウンドスキャン
 async function bgScan() {
   if (scanRunning || scanDone) return;
   scanRunning = true;
   let retries = 0;
   while (!scanDone && files.length < BATCH_SIZE) {
     try {
-      await fetchOnePage();
+      const prevLen = files.length;
+      await scanNextFolder();
       retries = 0;
       updateFolderBadge();
       updateStats();
-      // キューに新しいインデックスをランダムに挿入
-      for (let i = queue.length; i < files.length; i++) {
+      // 新しく追加された分をキューにランダム挿入
+      for (let i = prevLen; i < files.length; i++) {
         const pos = Math.floor(Math.random() * (queue.length - queuePos + 1)) + queuePos;
         queue.splice(pos, 0, i);
       }
-      await sleep(50); // UIをブロックしないよう少し待つ
+      await sleep(80);
     } catch(e) {
       retries++;
       if (retries > 5) { console.warn('バックグラウンド取得中断:', e.message); break; }
