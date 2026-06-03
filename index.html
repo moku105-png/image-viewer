@@ -642,7 +642,30 @@ async function connect() {
     clearCache();
     scanFolder = (f === '/') ? '' : f;
 
-    await fetchOnePage();
+    // 画像が見つかるまで最大10ページ取得してから表示開始
+    setLoadingMsg('画像を検索中...');
+    let initPages = 0;
+    while (!files.length && !scanDone && initPages < 10) {
+      await fetchOnePage();
+      initPages++;
+      setLoadingMsg('検索中... ' + totalFound + ' 枚見つかりました（フォルダ ' + folderCount + ' 個）');
+    }
+
+    if (!files.length && scanDone) {
+      hideLoading();
+      showError('画像が見つかりませんでした。\nフォルダパスを確認してください（例: /写真）\n対応形式: JPG, PNG, GIF, WebP, HEIC など');
+      showSetup();
+      return;
+    }
+
+    // まだ画像が見つかっていない場合はバックグラウンドで探しながら待機
+    if (!files.length && !scanDone) {
+      setLoadingMsg('画像を検索中... しばらくお待ちください');
+      while (!files.length && !scanDone) {
+        await fetchOnePage();
+        setLoadingMsg('検索中... ' + totalFound + ' 枚見つかりました（フォルダ ' + folderCount + ' 個）');
+      }
+    }
 
     if (!files.length) {
       hideLoading();
