@@ -678,14 +678,19 @@ async function fetchOnePage() {
     : DROPBOX_API + '/files/list_folder';
   const body = scanCursor ? { cursor: scanCursor } : { path: scanFolder, recursive: true };
 
+  console.log('[DBX] request:', url, JSON.stringify(body));
+
   let res;
   try { res = await dbFetch(url, body); }
   catch(e) { throw new Error('ネットワークエラー: ' + (e.message || String(e))); }
+
+  console.log('[DBX] response status:', res.status);
 
   if (!res.ok) {
     let msg = 'HTTPステータス ' + res.status;
     try {
       const j = await res.json();
+      console.log('[DBX] error body:', JSON.stringify(j));
       msg = j.error_summary || j.error || msg;
       if (res.status === 409) msg += '\nフォルダパスが存在しないか形式が正しくない可能性があります（先頭に / が必要）';
       if (res.status === 401) msg += '\nトークンが無効または期限切れです。新しいトークンを生成してください。';
@@ -697,9 +702,19 @@ async function fetchOnePage() {
   try { data = await res.json(); }
   catch(e) { throw new Error('レスポンス解析エラー: ' + e.message); }
 
+  console.log('[DBX] entries:', data.entries ? data.entries.length : 0, '/ has_more:', data.has_more);
+
+  // 最初の10件をログに出してファイル種別を確認
+  if (data.entries) {
+    data.entries.slice(0, 10).forEach(e => {
+      console.log('[DBX] entry:', e['.tag'], e.name, e.path_lower || '');
+    });
+  }
+
   for (const entry of (data.entries || [])) {
     if (entry['.tag'] === 'file') {
       const ext = (entry.name.split('.').pop() || '').toLowerCase();
+      console.log('[DBX] file ext:', ext, entry.name);
       if (IMG_EXT.has(ext)) {
         totalFound++;
         if (files.length < BATCH_SIZE) {
@@ -710,6 +725,7 @@ async function fetchOnePage() {
       folderCount++;
     }
   }
+  console.log('[DBX] totalFound so far:', totalFound, '/ files:', files.length);
   scanCursor = data.cursor || null;
   scanDone = !data.has_more;
 }
